@@ -1,8 +1,8 @@
 "use client";
 
-import { FormEvent, useEffect, useState, useTransition } from "react";
+import { FormEvent, useEffect, useState, useRef } from "react";
 import {
-  askQuestion,
+  askQuestionStream,
   ChatResponse,
   fetchStatus,
   rebuildIndex,
@@ -47,8 +47,13 @@ export function ChatShell() {
   const [messages, setMessages] = useState<Message[]>([]);
   const [query, setQuery] = useState("");
   const [error, setError] = useState<string | null>(null);
-  const [isPending, startTransition] = useTransition();
+  
+  // NEW: Replaced useTransition with a standard state boolean for streaming
+  const [isReceiving, setIsReceiving] = useState(false);
   const [isRefreshing, setIsRefreshing] = useState(false);
+  const [isUploading, setIsUploading] = useState(false);
+  
+  const fileInputRef = useRef<HTMLInputElement>(null);
 
   useEffect(() => {
     let active = true;
@@ -70,41 +75,95 @@ export function ChatShell() {
     };
   }, []);
 
-  const submitQuestion = (nextQuery: string) => {
-    const cleaned = nextQuery.trim();
-    if (!cleaned) {
+  const handleFileUpload = async (event: React.ChangeEvent<HTMLInputElement>) => {
+    const file = event.target.files?.[0];
+    if (!file) return;
+
+    if (!file.name.endsWith(".pdf")) {
+      setError("Please select a valid PDF file.");
       return;
     }
 
+    setIsUploading(true);
+    setError(null);
+
+    const formData = new FormData();
+    formData.append("file", file);
+
+    try {
+      const baseUrl = process.env.NEXT_PUBLIC_API_BASE_URL || "http://localhost:8000";
+      const response = await fetch(`${baseUrl}/api/v1/ingest/upload`, {
+        method: "POST",
+        body: formData,
+      });
+
+      if (!response.ok) {
+        const errorData = await response.json().catch(() => ({}));
+        throw new Error(errorData.detail || "Upload failed");
+      }
+
+      if (fileInputRef.current) {
+        fileInputRef.current.value = "";
+      }
+
+      const nextStatus = await fetchStatus();
+      setStatus(nextStatus);
+    } catch (err) {
+      const message =
+        err instanceof Error ? err.message : "Failed to upload document.";
+      setError(message);
+    } finally {
+      setIsUploading(false);
+    }
+  };
+
+  const submitQuestion = async (nextQuery: string) => {
+    const cleaned = nextQuery.trim();
+    if (!cleaned) return;
+
     setError(null);
     setQuery("");
+    setIsReceiving(true);
 
-    const userMessage: Message = {
-      id: `user-${Date.now()}`,
-      role: "user",
-      content: cleaned,
-    };
+    const userMessageId = `user-${Date.now()}`;
+    const assistantMessageId = `assistant-${Date.now()}`;
 
-    setMessages((current) => [...current, userMessage]);
+    // NEW: Instantly inject an empty assistant message bubble into the chat
+    setMessages((current) => [
+      ...current,
+      { id: userMessageId, role: "user", content: cleaned },
+      { id: assistantMessageId, role: "assistant", content: "" },
+    ]);
 
-    startTransition(async () => {
-      try {
-        const response = await askQuestion(cleaned);
-        setMessages((current) => [
-          ...current,
-          {
-            id: `assistant-${Date.now()}`,
-            role: "assistant",
-            content: response.answer,
-            response,
-          },
-        ]);
-      } catch (err) {
-        const message =
-          err instanceof Error ? err.message : "Something went wrong.";
-        setError(message);
-      }
-    });
+    try {
+      // NEW: Call the streaming API and append text dynamically as it arrives
+      const finalResponse = await askQuestionStream(cleaned, (newText) => {
+        setMessages((current) =>
+          current.map((msg) =>
+            msg.id === assistantMessageId
+              ? { ...msg, content: msg.content + newText }
+              : msg
+          )
+        );
+      });
+
+      // NEW: When the stream is fully finished, attach the citations
+      setMessages((current) =>
+        current.map((msg) =>
+          msg.id === assistantMessageId
+            ? { ...msg, response: finalResponse }
+            : msg
+        )
+      );
+    } catch (err) {
+      const message = err instanceof Error ? err.message : "Something went wrong.";
+      setError(message);
+      
+      // Remove the empty assistant bubble if the request failed immediately
+      setMessages((current) => current.filter((msg) => msg.id !== assistantMessageId));
+    } finally {
+      setIsReceiving(false);
+    }
   };
 
   const handleSubmit = (event: FormEvent<HTMLFormElement>) => {
@@ -138,18 +197,13 @@ export function ChatShell() {
         <div className="hero-copy">
           <span className="eyebrow">RAG System</span>
           <h1>Ask questions about your document.</h1>
-          <p>
-            Get clear answers from the PDF in a simple chat
-            experience.
-          </p>
+          <p>Get clear answers from the PDF in a simple chat experience.</p>
         </div>
 
         <div className="status-panel compact">
           <div className="status-copy">
             <strong>
-              {status?.index_ready
-                ? "Document is ready"
-                : "Preparing your document"}
+              {status?.index_ready ? "Document is ready" : "Preparing your document"}
             </strong>
             <p>
               {status?.index_ready
@@ -157,13 +211,31 @@ export function ChatShell() {
                 : "If you updated the PDF, refresh the document first."}
             </p>
           </div>
-          <button
-            className="ghost-button"
-            onClick={handleRefresh}
-            disabled={isRefreshing}
-          >
-            {isRefreshing ? "Refreshing..." : "Refresh document"}
-          </button>
+          
+          <div style={{ display: "flex", gap: "8px" }}>
+            <input
+              type="file"
+              accept=".pdf"
+              ref={fileInputRef}
+              onChange={handleFileUpload}
+              style={{ display: "none" }}
+            />
+            <button
+              className="ghost-button"
+              onClick={() => fileInputRef.current?.click()}
+              disabled={isUploading}
+              type="button"
+            >
+              {isUploading ? "Uploading..." : "Upload PDF"}
+            </button>
+            <button
+              className="ghost-button"
+              onClick={handleRefresh}
+              disabled={isRefreshing || isUploading}
+            >
+              {isRefreshing ? "Refreshing..." : "Refresh document"}
+            </button>
+          </div>
         </div>
       </section>
 
@@ -182,6 +254,7 @@ export function ChatShell() {
               className="starter-chip"
               onClick={() => submitQuestion(prompt)}
               type="button"
+              disabled={isReceiving}
             >
               {prompt}
             </button>
@@ -191,10 +264,7 @@ export function ChatShell() {
         <div className="messages-panel">
           {messages.length === 0 ? (
             <div className="empty-state">
-              <p>
-                Type a question below and I will answer using the
-                PDF.
-              </p>
+              <p>Type a question below and I will answer using the PDF.</p>
             </div>
           ) : (
             messages.map((message) => {
@@ -210,7 +280,13 @@ export function ChatShell() {
                   <span className="message-role">
                     {message.role === "assistant" ? "Assistant" : "You"}
                   </span>
-                  <p>{message.content}</p>
+                  
+                  {/* Show a blinking cursor indicator if the message is completely empty and currently receiving */}
+                  {message.content === "" && isReceiving ? (
+                     <p className="streaming-cursor">Looking through the PDF...</p>
+                  ) : (
+                     <p>{message.content}</p>
+                  )}
 
                   {message.response && pageReference ? (
                     <p className="page-reference">{pageReference}</p>
@@ -219,13 +295,6 @@ export function ChatShell() {
               );
             })
           )}
-
-          {isPending ? (
-            <article className="message-bubble assistant loading">
-              <span className="message-role">Assistant</span>
-              <p>Looking through the PDF...</p>
-            </article>
-          ) : null}
         </div>
 
         <form className="composer" onSubmit={handleSubmit}>
@@ -239,10 +308,10 @@ export function ChatShell() {
           />
           <button
             className="primary-button"
-            disabled={isPending || !query.trim()}
+            disabled={isReceiving || !query.trim()}
             type="submit"
           >
-            {isPending ? "Thinking..." : "Send"}
+            {isReceiving ? "Thinking..." : "Send"}
           </button>
         </form>
 

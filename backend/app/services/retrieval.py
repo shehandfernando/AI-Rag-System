@@ -3,6 +3,7 @@ from dataclasses import dataclass
 
 from langchain_community.vectorstores import FAISS
 from rank_bm25 import BM25Okapi
+from flashrank import Ranker, RerankRequest
 
 from app.core.config import Settings
 from app.services.documents import RetrievedChunk, tokenize
@@ -27,6 +28,7 @@ class HybridRetriever:
         self._chunk_records: list[dict] = []
         self._tokenized_chunks: list[list[str]] = []
         self._bm25: BM25Okapi | None = None
+        self._ranker: Ranker | None = None  # FlashRank state
 
     def is_ready(self) -> bool:
         return self.settings.vectorstore_dir.exists() and self.settings.chunk_cache_path.exists()
@@ -47,6 +49,10 @@ class HybridRetriever:
     def _ensure_ready(self) -> None:
         if self._vectorstore is None or self._bm25 is None:
             self.refresh()
+        
+        # Initialize the lightweight CPU reranker lazily
+        if self._ranker is None:
+            self._ranker = Ranker()
 
     @staticmethod
     def _keyword_overlap(query_tokens: list[str], doc_tokens: list[str]) -> float:
@@ -61,10 +67,12 @@ class HybridRetriever:
         self._ensure_ready()
         assert self._vectorstore is not None
         assert self._bm25 is not None
+        assert self._ranker is not None
 
         query_tokens = tokenize(query)
         candidates: dict[str, _Candidate] = {}
 
+        # --- PHASE 1: HYBRID RETRIEVAL (The Wide Net) ---
         vector_results = self._vectorstore.similarity_search_with_score(
             query,
             k=self.settings.retriever_fetch_k,
@@ -141,5 +149,46 @@ class HybridRetriever:
                 )
             )
 
+        # Sort by the initial hybrid score
         retrieved.sort(key=lambda chunk: chunk.score, reverse=True)
-        return retrieved[:top_k]
+
+        # --- PHASE 2: CROSS-ENCODER RERANKING (The Sniper) ---
+        pool_size = max(top_k * 3, 20)
+        rerank_pool = retrieved[:pool_size]
+
+        if not rerank_pool:
+            return []
+
+        # Format the data exactly as FlashRank expects
+        passages = [
+            {
+                "id": chunk.chunk_id,
+                "text": chunk.content,
+                "meta": chunk  # Stash the original object to easily retrieve it later
+            }
+            for chunk in rerank_pool
+        ]
+
+        # Execute the reranker
+        request = RerankRequest(query=query, passages=passages)
+        reranked_results = self._ranker.rerank(request)
+
+        # Re-map the results back to a new RetrievedChunk to avoid FrozenInstance errors
+        final_chunks: list[RetrievedChunk] = []
+        for result in reranked_results:
+            original_chunk: RetrievedChunk = result["meta"]
+            
+            updated_chunk = RetrievedChunk(
+                chunk_id=original_chunk.chunk_id,
+                content=original_chunk.content,
+                page_number=original_chunk.page_number,
+                source=original_chunk.source,
+                score=round(float(result["score"]), 4),  # Overwrite with FlashRank score
+                vector_score=original_chunk.vector_score,
+                bm25_score=original_chunk.bm25_score,
+                overlap_score=original_chunk.overlap_score,
+            )
+            final_chunks.append(updated_chunk)
+
+        # FlashRank naturally returns the array sorted by highest score
+        return final_chunks[:top_k]

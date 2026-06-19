@@ -1,4 +1,5 @@
 import json
+import time
 from dataclasses import dataclass
 
 from langchain_community.document_loaders import PyPDFLoader
@@ -100,8 +101,27 @@ def _write_chunk_cache(settings: Settings, chunks: list[Document]) -> None:
 def build_index(settings: Settings) -> BuildIndexResult:
     documents = load_pdf_documents(settings)
     chunks = split_documents(settings, documents)
+    embeddings = _get_embeddings(settings)
 
-    vectorstore = FAISS.from_documents(chunks, _get_embeddings(settings))
+    vectorstore = None
+    batch_size = 50  # Keep safely under the 100 RPM limit
+    delay_seconds = 2  # Give the API a moment to breathe
+
+    # Process chunks in controlled batches
+    for i in range(0, len(chunks), batch_size):
+        batch = chunks[i : i + batch_size]
+        
+        if vectorstore is None:
+            # First batch creates the initial FAISS index
+            vectorstore = FAISS.from_documents(batch, embeddings)
+        else:
+            # Subsequent batches append to the existing index
+            vectorstore.add_documents(batch)
+        
+        # If there are more batches left, pause before hitting the API again
+        if i + batch_size < len(chunks):
+            time.sleep(delay_seconds)
+
     settings.vectorstore_dir.mkdir(parents=True, exist_ok=True)
     vectorstore.save_local(str(settings.vectorstore_dir))
     _write_chunk_cache(settings, chunks)

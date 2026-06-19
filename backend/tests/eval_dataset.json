@@ -1,0 +1,14 @@
+[
+  {
+    "question": "What is the size of the message digest in the SHA-512 algorithm?",
+    "expected_text_snippet": "512-bit message digest"
+  },
+{
+    "question": "What does the Lyapunov exponent refer to?",
+    "expected_text_snippet": "separation pace of infinitesimally close trajec- tories"
+  },
+  {
+    "question": "What is produced by merging the cosine and logistic maps?",
+    "expected_text_snippet": "cosine logistic map (clm)"
+  }
+]

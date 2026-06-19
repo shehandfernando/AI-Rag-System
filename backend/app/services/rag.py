@@ -182,6 +182,7 @@ class RAGService:
         )
 
     def answer_question(self, payload: ChatRequest) -> ChatResponse:
+        """The original synchronous fallback function."""
         if not self.retriever.is_ready():
             if self.settings.allow_index_auto_build:
                 self.rebuild_index()
@@ -245,3 +246,96 @@ class RAGService:
             retrieved_chunks=len(retrieved_chunks),
             system_notes=parsed.missing_information,
         )
+
+    async def stream_answer_question(self, payload: ChatRequest):
+        """
+        An async generator that streams the LLM's text tokens to the client 
+        and sends the final citation metadata at the very end.
+        """
+        import json
+        from langchain_core.prompts import ChatPromptTemplate
+        
+        if not self.retriever.is_ready():
+            if self.settings.allow_index_auto_build:
+                self.rebuild_index()
+            else:
+                yield f"data: {json.dumps({'error': 'Vector index missing.'})}\n\n"
+                return
+
+        top_k = min(payload.top_k, self.settings.max_context_chunks)
+        query_lower = payload.query.lower()
+        
+        # 1. Intent Router: Detect broad summary queries
+        is_summary = any(word in query_lower for word in ["summar", "major topic", "overview", "main idea", "about"])
+
+        if is_summary:
+            # Bypass similarity search and grab the absolute first few chunks (Abstract / Intro)
+            raw_chunks = self.retriever._chunk_records[:top_k]
+            retrieved_chunks = [
+                RetrievedChunk(
+                    chunk_id=c["chunk_id"],
+                    content=c["content"],
+                    page_number=c.get("page_number"),
+                    source=c.get("source", "Unknown"),
+                    score=1.0, vector_score=1.0, bm25_score=1.0, overlap_score=1.0
+                )
+                for c in raw_chunks
+            ]
+        else:
+            # 2. Standard Vector Search for specific questions
+            retrieved_chunks = self.retriever.retrieve(payload.query, top_k=top_k)
+            
+            # Strict safety cutoff for irrelevant search results
+            if not retrieved_chunks or retrieved_chunks[0].score < self.settings.min_retrieval_score:
+                final_res = self._abstain("Context insufficient or low score.", retrieved_chunks)
+                yield f"data: {json.dumps({'type': 'token', 'text': final_res.answer})}\n\n"
+                yield f"data: {json.dumps({'type': 'final', 'payload': final_res.model_dump()})}\n\n"
+                return
+
+        stream_prompt = ChatPromptTemplate.from_messages([
+            ("system", 
+             "You are a highly helpful assistant. Use the provided context to answer the user's question. "
+             "If the answer is not in the context, explicitly state that you cannot answer based on the provided document. "
+             "Do not hallucinate. Do not wrap your response in JSON."),
+            ("human", 
+             "Context:\n{context}\n\nQuestion:\n{question}")
+        ])
+        
+        context_str = self._build_context(retrieved_chunks)
+        formatted_messages = stream_prompt.format_messages(
+            question=payload.query, 
+            context=context_str
+        )
+
+        llm = self._get_llm()
+        full_answer = ""
+
+        async for chunk in llm.astream(formatted_messages):
+            if chunk.content:
+                text_piece = str(chunk.content)
+                full_answer += text_piece
+                yield f"data: {json.dumps({'type': 'token', 'text': text_piece})}\n\n"
+
+        is_grounded = "cannot answer based on the provided document" not in full_answer.lower()
+        
+        citations = [
+            Citation(
+                chunk_id=c.chunk_id,
+                page=c.page_number,
+                score=c.score,
+                excerpt=trim_excerpt(c.content)
+            ) for c in retrieved_chunks
+        ]
+
+        final_response = ChatResponse(
+            answer=full_answer.strip(),
+            grounded=is_grounded,
+            confidence=1.0 if is_summary else self._retrieval_confidence(retrieved_chunks),
+            answer_mode="grounded" if is_grounded else "insufficient_context",
+            citations=citations if payload.include_sources else [],
+            retrieved_chunks=len(retrieved_chunks),
+            system_notes=[]
+        )
+
+        yield f"data: {json.dumps({'type': 'final', 'payload': final_response.model_dump()})}\n\n"
+        yield "data: [DONE]\n\n"
