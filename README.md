@@ -1,155 +1,85 @@
-# RAG System
+# Full-Stack AI RAG System with Real-Time Streaming
 
-This repository started as a notebook-first RAG prototype in `rag_notebook.ipynb`. The notebook loads `pdfs/mathematics.pdf`, chunks it, embeds it with Gemini, stores vectors in FAISS, retrieves the top matches, and answers with a constrained prompt. That same flow was then copied into a basic Streamlit app in `app.py`.
+A production-ready Retrieval-Augmented Generation (RAG) application designed to accurately extract, retrieve, and synthesize information from complex academic documents. 
 
-The project is now split into a production-leaning full-stack structure:
+This project allows users to dynamically upload PDFs and query them through a highly responsive chat interface. It utilizes a multi-stage retrieval pipeline to ensure the LLM strictly grounds its answers in the provided context, preventing hallucinations.
 
-```text
-rag_chatbot/
-├─ backend/
-│  ├─ app/
-│  │  ├─ api/routes/
-│  │  ├─ core/
-│  │  ├─ models/
-│  │  └─ services/
-│  ├─ data/
-│  ├─ .env.example
-│  └─ requirements.txt
-├─ frontend/
-│  ├─ app/
-│  ├─ components/
-│  ├─ lib/
-│  ├─ .env.example
-│  └─ package.json
-├─ pdfs/
-│  └─ mathematics.pdf
-├─ vectorstores/
-│  └─ mathematics_faiss_gemini/
-├─ rag_notebook.ipynb
-├─ app.py
-└─ README.md
-```
+## ✨ Key Features
 
-## What The Notebook Already Did
+* **Real-Time Streaming (SSE):** Implements Server-Sent Events to stream LLM tokens directly to the Next.js UI character-by-character, providing a native ChatGPT-like experience without blocking requests.
+* **Hybrid Retrieval Pipeline:** Combines **FAISS** vector similarity search (for semantic meaning) with **BM25** keyword matching (for exact terminology) to cast a wide, highly accurate net for relevant document chunks.
+* **Cross-Encoder Reranking:** Utilizes the **FlashRank** model to re-score and filter the initial retrieved chunks, ensuring pinpoint precision before sending context to the LLM.
+* **Smart Intent Routing:** Features an "Abstract Bypass" router that detects broad summary requests and intelligently feeds introductory cache data to the LLM, bypassing the standard vector search limits.
+* **Dynamic Document Ingestion:** Users can upload new PDFs directly through the web UI. The backend automatically parses, chunks, and embeds the text in the background.
+* **Automated Regression Testing:** Includes a robust `pytest` suite designed to continuously validate the accuracy of the retrieval pipeline against expected document facts.
 
-`rag_notebook.ipynb` currently does these steps:
+## 🛠️ Tech Stack
 
-1. Loads the mathematics PDF with `PyPDFLoader`.
-2. Splits text with `RecursiveCharacterTextSplitter`.
-3. Builds a FAISS vector store using `models/gemini-embedding-001`.
-4. Retrieves the top matching chunks for a question.
-5. Sends retrieved context to `gemini-2.5-flash`.
-6. Returns an answer with a simple "only use the context" prompt.
-7. Writes the same logic into the Streamlit prototype in `app.py`.
+**Frontend:**
+* Next.js (React)
+* TypeScript
+* CSS (Custom modular styling)
 
-That notebook is a solid proof of concept, but it still mixes ingestion, retrieval, generation, and UI in one place.
+**Backend:**
+* Python (FastAPI, Uvicorn)
+* LangChain & LangGraph
+* Pytest (Regression testing)
 
-## New Architecture
+**AI & Machine Learning:**
+* **LLM & Embeddings:** Google Gemini (`gemini-embedding-1.0` and Chat models)
+* **Vector Database:** FAISS (Facebook AI Similarity Search)
+* **Keyword Indexing:** BM25 (Okapi)
+* **Reranking:** FlashRank (Cross-Encoder)
 
-### Backend
+---
 
-The backend is a FastAPI service that owns the RAG logic:
+## 🚀 Getting Started
 
-- Validated request and response schemas with Pydantic.
-- PDF ingestion and chunk caching.
-- FAISS vector retrieval plus BM25 lexical retrieval.
-- Hybrid score fusion to reduce missed relevant chunks.
-- Strict JSON answer contract from the LLM.
-- Citation validation so only retrieved chunks can be cited.
-- Abstention logic when evidence is weak or the model output is malformed.
+### Prerequisites
+* Node.js (v18+)
+* Python (3.11+)
+* A free [Google Gemini API Key](https://aistudio.google.com/)
 
-Important files:
-
-- `backend/app/main.py`
-- `backend/app/api/routes/chat.py`
-- `backend/app/api/routes/ingest.py`
-- `backend/app/models/schemas.py`
-- `backend/app/services/indexing.py`
-- `backend/app/services/retrieval.py`
-- `backend/app/services/rag.py`
-
-### Frontend
-
-The frontend is a minimal Next.js app focused on usability:
-
-- Clean single-page chat experience.
-- Status panel for API and index health.
-- Citation cards for every grounded answer.
-- Rebuild-index action.
-- A deliberately minimal visual language so the model output stays central.
-
-Important files:
-
-- `frontend/app/page.tsx`
-- `frontend/components/chat-shell.tsx`
-- `frontend/lib/api.ts`
-- `frontend/app/globals.css`
-
-## Hallucination Reduction Strategy
-
-This version is designed to reduce hallucination much more aggressively than the notebook prototype:
-
-- Retrieval is hybrid, not dense-only.
-- Temperature is fixed at `0`.
-- The prompt forbids outside knowledge.
-- The model must return structured JSON.
-- The backend validates the model output.
-- The backend rejects answers without valid citations.
-- Low-confidence retrieval triggers an abstain response instead of a guessed answer.
-- Chunk cache persistence helps debug retrieval quality over time.
-
-## Backend Setup
-
-Create `backend/.env` from `backend/.env.example`:
-
-```env
-GOOGLE_API_KEY=your_google_api_key
-```
-
-Install dependencies:
-
-```bash
-pip install -r backend/requirements.txt
-```
-
-Run the API from the `backend/` folder:
+### 1. Backend Setup
+Navigate to the backend directory and install the dependencies:
 
 ```bash
 cd backend
-uvicorn app.main:app --reload
+pip install -r requirements.txt
+pip install flashrank python-multipart
 ```
 
-Useful endpoints:
-
-- `GET /health`
-- `POST /api/v1/chat/query`
-- `GET /api/v1/ingest/status`
-- `POST /api/v1/ingest/rebuild`
-
-## Frontend Setup
-
-Create `frontend/.env.local` from `frontend/.env.example`:
+Create a `.env` file in the `backend/` directory and add your API key:
 
 ```env
-NEXT_PUBLIC_API_BASE_URL=http://localhost:8000
+GOOGLE_API_KEY=your_gemini_api_key_here
 ```
 
-Then install and run:
+Start the FastAPI server:
+
+```bash
+python -m uvicorn app.main:app --reload
+```
+*The backend will be running at `http://127.0.0.1:8000`*
+
+### 2. Frontend Setup
+Open a new terminal window, navigate to the frontend directory, and install the dependencies:
 
 ```bash
 cd frontend
 npm install
-npm run dev
 ```
 
-## Suggested Next Improvements
+Start the Next.js development server:
 
-- Add a small evaluation dataset for regression testing.
-- Add reranking after hybrid retrieval.
-- Add streaming responses for the frontend.
-- Add observability around retrieval score distributions and abstain rates.
-- Add unit tests for parser fallback, citation enforcement, and rebuild flow.
+```bash
+npm run dev
+```
+*The frontend will be running at `http://localhost:3000`*
 
-## Legacy Prototype
+## 🧪 Running Tests
+To ensure the retrieval pipeline is accurately finding the expected context, run the regression suite from the `backend/` directory:
 
-`rag_notebook.ipynb` and `app.py` are still useful as the original prototype and reference implementation. The new `backend/` and `frontend/` folders are the recommended path forward.
+```bash
+python -m pytest tests/test_retrieval.py -v
+```
